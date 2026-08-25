@@ -76903,3 +76903,4 @@ g_windGlobalB,0x012B8E00,WindModuleInfo ctor global
 ?BfmeCopy009C94C0@@YAXPAUBfmeValue009C94C0@@PBU1@@Z,0x009C9120,Open-BFME5 ILT the value copy the clone-node body at 0x009C94C0 calls
 ?BfmeCopy009D02C0@@YAXPAUBfmeValue009D02C0@@PBU1@@Z,0x009CF3C0,Open-BFME5 ILT the value copy the clone-node body at 0x009D02C0 calls
 _Rva0080E500,0x0080E500,address-derived cleanup helper invoked immediately before release by 0x0080E4D0
+_Rva00812CD0,0x00812CD0,address-derived cleanup helper invoked for the owned field at offset 0x64 by 0x0080F0D0
