@@ -27,6 +27,7 @@ enum { UPDATE_RVA=0x6E910, RESET_RVA=0x6E7A0, LOGIC_UPDATE_RVA=0x38DA10,
        PARTICLE_GET_N=6, PARTICLE_STATE_N=8192, PARTICLE_PATCH_N=16384,
        UPDATE_N=5, SCHED_N=13, RESET_CLOCK_N=18, LOGIC_UPDATE_N=7,
        HLOD_N=11, D1_N=5, D81_N=9, STATE_N=512,
+       NATIVE_NETWORK_VTABLE_RVA=0xD1A968,
        MANUAL_CALLER=0x00B5CA51, STATE3_CLOCK_CALLER=0x00AF4142 };
 typedef struct { DWORD object,motion,lastTick; float input,output; int frames,mode; BOOL valid; } FrameState;
 typedef struct { DWORD object,motion,lastTick; float frame; int mode; BOOL valid; } ObjectAnimState;
@@ -115,6 +116,8 @@ static volatile LONG g_skipPhaseDispatch;
 static volatile LONG g_w3dClockFrozen;
 static volatile LONG g_legacyPhaseCalls;
 static LONG g_lastForeground=-1;
+static volatile LONG g_focusForeground=-1,g_networkFocusRebasePending,g_networkSessionResetPending;
+static volatile LONG g_networkFocusRebases,g_networkSessionResets;
 static const BYTE kUpdate[]={0x51,0x53,0x56,0x8B,0xF1};
 static const BYTE kClientUpdate[]={0x6A,0xFF,0x68,0xD8,0x2A,0xFF,0x00};
 static const BYTE kDeltaProvider[]={0x51,0x56,0x8B,0xF1,0x8B,0x86,0x04,0x06,0x00,0x00};
@@ -142,7 +145,32 @@ static const BYTE kB5Timer[]={0x8B,0xC1,0x8B,0x4C,0x24,0x04};
 static BOOL match(const BYTE*a,const BYTE*b,SIZE_T n){SIZE_T i;for(i=0;i<n;i++)if(a[i]!=b[i])return FALSE;return TRUE;}
 static void cp(BYTE*d,const BYTE*s,SIZE_T n){SIZE_T i;for(i=0;i<n;i++)d[i]=s[i];}
 static void b(BYTE**p,BYTE x){*(*p)++=x;} static void d(BYTE**p,DWORD x){cp(*p,(BYTE*)&x,4);*p+=4;}
+static BOOL read32(DWORD address,DWORD *value);
+static BOOL read64(DWORD address,LONGLONG *value);
 static float visual_frame_scale(void){float s=g_visual.frameScale;return s>=0.0f&&s<=2.0f?s:1.0f;}
+static LONG process_is_foreground(void){
+  HWND window=GetForegroundWindow();DWORD pid=0;
+  if(window)GetWindowThreadProcessId(window,&pid);
+  return pid==GetCurrentProcessId();
+}
+static void observe_focus_state(LONG foreground){
+  LONG previous=InterlockedExchange(&g_focusForeground,foreground);
+  if(previous==1&&foreground==0)InterlockedExchange(&g_networkFocusRebasePending,1);
+}
+static BOOL rebase_native_network_clock(LARGE_INTEGER now,BOOL preserveQuantum){
+  DWORD network,vtable,state;LONGLONG clocks[2],frequency,quantum,value;SIZE_T wrote=0;
+  if(!g_image)return FALSE;
+  if(!read32((DWORD)(ULONG_PTR)(g_image+(0x012F7714-0x00400000)),&network)||!network)return FALSE;
+  if(!read32(network,&vtable))return FALSE;
+  if(vtable!=(DWORD)(ULONG_PTR)(g_image+NATIVE_NETWORK_VTABLE_RVA))return FALSE;
+  if(!read32(network+0x0C,&state)||state!=1)return FALSE;
+  if(!read64(network+0x10,&frequency)||frequency<=0)return FALSE;
+  quantum=frequency/5;if(quantum<=0)return FALSE;
+  if(!read64(network+0x20,&value))return FALSE;
+  if(!preserveQuantum)value=0;else{if(value<0)value=0;if(value>quantum)value=quantum;}
+  clocks[0]=now.QuadPart;clocks[1]=value;
+  return WriteProcessMemory(GetCurrentProcess(),(void*)(ULONG_PTR)(network+0x18),clocks,sizeof(clocks),&wrote)&&wrote==sizeof(clocks);
+}
 /* Keyboard, screen-edge and RMB camera scroll all converge on View vslot
    0x48.  Retail applies the supplied delta once per 30-Hz visual frame, so
    scale the local copy by elapsed authored-frame time.  This is client-only:
@@ -452,7 +480,7 @@ static const char *timing_class_name(TimingClass value){
   return "UNKNOWN";
 }
 static void open_timing_log(void){
-  DWORD size,wrote;static const char header[]="wall_ms,active_s,visual_fps,logic_calls,logic_ticks,measured_hz,target_hz,interval_s,accumulator_s,pending_tick,attempt_in_flight,pending_interval_s,due_attempts,network_blocks,pending_created,pending_retries,pending_cleared,pending_discarded,logic_frame,client_frame,saved_client_frame,animation_delta_s,slowdown,visual_phase,legacy_frame_scale,visual_period,pause,low_fps,network_present,network_admission,classification,game_mode,max_fps,use_fps_limit,limit_frame_rate,logic_time_scale,logic_frame_adjustment,frame_elapsed_ms,sleep_remaining_ms,sleep_total_ms,previous_frame_ms,w3d_frame_ms,engine_active,foreground\r\n";
+  DWORD size,wrote;static const char header[]="wall_ms,active_s,visual_fps,logic_calls,logic_ticks,measured_hz,target_hz,interval_s,accumulator_s,pending_tick,attempt_in_flight,pending_interval_s,due_attempts,network_blocks,pending_created,pending_retries,pending_cleared,pending_discarded,logic_frame,client_frame,saved_client_frame,animation_delta_s,slowdown,visual_phase,legacy_frame_scale,visual_period,pause,low_fps,network_present,network_admission,classification,game_mode,max_fps,use_fps_limit,limit_frame_rate,logic_time_scale,logic_frame_adjustment,frame_elapsed_ms,sleep_remaining_ms,sleep_total_ms,previous_frame_ms,w3d_frame_ms,engine_active,foreground,client_minus_saved,saved_plus_6_gate,client_frame_period,client_frame_counter,client_frame_ratio,client_frame_ratio_pending,gameclient_advance_frame,client_frame_limit,native_network_object,native_network_vtable,native_network_state,native_qpc_age_ms,native_accumulator_ms,native_pacing_estimate,native_advance_ready,network_focus_rebases,network_session_resets\r\n";
   if(g_timingLog!=INVALID_HANDLE_VALUE)return;
   g_timingLog=CreateFileA("C:\\BFME1\\BFME_MULTIPLAYER_TICK_DIAGNOSTIC.csv",GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,0,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,0);
   if(g_timingLog==INVALID_HANDLE_VALUE)g_timingLog=CreateFileA("BFME_MULTIPLAYER_TICK_DIAGNOSTIC.csv",GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,0,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,0);
@@ -461,26 +489,32 @@ static void open_timing_log(void){
   if(size==0)WriteFile(g_timingLog,header,sizeof(header)-1,&wrote,0);
 }
 static void log_timing(TimingClass classification,const char *admission,BOOL force){
-  char line[1280];int n,maxFps=0,logicAdjust=0,logicFrame=-1,clientFrame=-1,savedClientFrame=-1;DWORD wrote,now=GetTickCount(),network=0,frameElapsed=0,sleepRemaining=0,sleepTotal=0,previousFrame=0,w3dFrame=0,foregroundPid=0;double target;float logicScale=0.0f;BYTE useFps=0,limitRate=0,engineActive=0;LONG foreground,pending,attempt;void *engine,*global,*logic;HWND foregroundWindow;
+  char line[2048];int n,maxFps=0,logicAdjust=0,logicFrame=-1,clientFrame=-1,savedClientFrame=-1,clientMinusSaved=-999,savedGate=-1,clientPeriod=-1,clientCounter=-1,nativeState=-1,nativePacing=-1,nativeReady=-1;DWORD wrote,now=GetTickCount(),network=0,networkVtable=0,clientAddress=0,frameElapsed=0,sleepRemaining=0,sleepTotal=0,previousFrame=0,w3dFrame=0,foregroundPid=0,temp=0;double target,nativeQpcAgeMs=-1.0,nativeAccumulatorMs=-1.0;float logicScale=0.0f,clientRatio=-1.0f,clientLimit=-1.0f;BYTE useFps=0,limitRate=0,engineActive=0,ratioPending=0xFF,gameClientAdvance=0xFF;LONG foreground,pending,attempt;void *engine,*global,*logic;HWND foregroundWindow;
   foregroundWindow=GetForegroundWindow();if(foregroundWindow)GetWindowThreadProcessId(foregroundWindow,&foregroundPid);foreground=foregroundPid==GetCurrentProcessId();
   if(foreground!=g_lastForeground){g_lastForeground=foreground;force=TRUE;}
   if(!force&&classification==g_timing.lastClass&&(DWORD)(now-g_timing.lastLogMs)<1000)return;
   if(g_image){
     network=*(volatile DWORD*)(g_image+(0x012F7714-0x00400000));
     engine=*(void**)(g_image+(0x012ED524-0x00400000));global=*(void**)(g_image+(0x012ED5C8-0x00400000));
-    if(engine){maxFps=*(volatile int*)((BYTE*)engine+8);engineActive=*(volatile BYTE*)((BYTE*)engine+0x0D);}
+    if(engine){maxFps=*(volatile int*)((BYTE*)engine+8);engineActive=*(volatile BYTE*)((BYTE*)engine+0x0D);clientPeriod=*(volatile int*)((BYTE*)engine+0x30);clientCounter=*(volatile int*)((BYTE*)engine+0x34);clientRatio=*(volatile float*)((BYTE*)engine+0x38);ratioPending=*(volatile BYTE*)((BYTE*)engine+0x3C);clientLimit=*(volatile float*)((BYTE*)engine+0x40);}
     if(global)useFps=*(volatile BYTE*)((BYTE*)global+0x1E);
     limitRate=*(volatile BYTE*)(g_image+(0x012ED520-0x00400000));logicScale=*(volatile float*)(g_image+(0x012A72A4-0x00400000));
     {int *adjust=*(int**)(g_image+(0x012A7244-0x00400000));if(adjust)logicAdjust=*adjust;}
     frameElapsed=*(volatile DWORD*)(g_image+(0x012ED514-0x00400000));sleepRemaining=*(volatile DWORD*)(g_image+(0x012ED510-0x00400000));sleepTotal=*(volatile DWORD*)(g_image+(0x012ED50C-0x00400000));previousFrame=*(volatile DWORD*)(g_image+(0x012ED518-0x00400000));w3dFrame=*(volatile DWORD*)(g_image+W3D_FRAME_MS_RVA);
     logic=*(void**)(g_image+(0x012F0898-0x00400000));if(logic)logicFrame=*(volatile int*)((BYTE*)logic+0x3C);
-    /* Vtable slot +0x64 is not GameClient::getFrame(): retail passes it one
-       stack argument.  Calling it as a zero-argument diagnostic corrupted its
-       frame-index input and crashed startup.  Keep this unproven field blank. */
-    savedClientFrame=*(volatile int*)(g_image+(0x012ED508-0x00400000));
+    if(read32((DWORD)(ULONG_PTR)(g_image+(0x012F1464-0x00400000)),&clientAddress)&&clientAddress&&read32(clientAddress+0xC4,&temp))gameClientAdvance=(BYTE)temp;
+    savedClientFrame=*(volatile int*)(g_image+(0x012ED508-0x00400000));if(clientFrame>=0){clientMinusSaved=clientFrame-savedClientFrame;savedGate=(DWORD)savedClientFrame+6>(DWORD)clientFrame;}
+    if(network){
+      read32(network,&networkVtable);
+      if(networkVtable==(DWORD)(ULONG_PTR)(g_image+NATIVE_NETWORK_VTABLE_RVA)){
+        LARGE_INTEGER sampleNow;LONGLONG frequency,lastCounter,accumulator,quantum;
+        if(read32(network+0x0C,&temp))nativeState=(int)temp;
+        if(read64(network+0x10,&frequency)&&read64(network+0x18,&lastCounter)&&read64(network+0x20,&accumulator)&&frequency>0){QueryPerformanceCounter(&sampleNow);nativeQpcAgeMs=(double)(sampleNow.QuadPart-lastCounter)*1000.0/(double)frequency;nativeAccumulatorMs=(double)accumulator*1000.0/(double)frequency;quantum=frequency/5;nativeReady=accumulator>=quantum;if(accumulator<quantum)nativePacing=0;else if((double)accumulator<(double)quantum*1.5)nativePacing=1;else nativePacing=2;}
+      }
+    }
   }
   target=bfme_target_hz(g_timing.fps);pending=InterlockedCompareExchange(&g_pendingTick,0,0);attempt=InterlockedCompareExchange(&g_admissionAttemptInFlight,0,0);
-  n=_snprintf(line,sizeof(line)-1,"%lu,%.6f,%.3f,%lu,%lu,%.3f,%.3f,%.6f,%.6f,%ld,%ld,%.6f,%lu,%lu,%lu,%lu,%lu,%lu,%d,%d,%d,%.6f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%s,%s,%d,%d,%d,%d,%.6f,%d,%lu,%lu,%lu,%lu,%lu,%d,%d\r\n",
+  n=_snprintf(line,sizeof(line)-1,"%lu,%.6f,%.3f,%lu,%lu,%.3f,%.3f,%.6f,%.6f,%ld,%ld,%.6f,%lu,%lu,%lu,%lu,%lu,%lu,%d,%d,%d,%.6f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%s,%s,%d,%d,%d,%d,%.6f,%d,%lu,%lu,%lu,%lu,%lu,%d,%d,%d,%d,%d,%d,%.6f,%u,%u,%.6f,%08lX,%08lX,%d,%.3f,%.3f,%d,%d,%ld,%ld\r\n",
     (unsigned long)now,g_timing.activeSeconds,g_timing.fps,
     (unsigned long)g_timing.logicCalls,(unsigned long)g_timing.logicTicks,
     g_timing.measuredHz,target,g_timing.clock.interval,g_timing.clock.accumulator,
@@ -493,7 +527,8 @@ static void log_timing(TimingClass classification,const char *admission,BOOL for
     classification==PAUSED,classification==LOW_FPS_SLOWDOWN,network!=0,
     admission,timing_class_name(classification),g_timing.lastMode,
     maxFps,(int)useFps,(int)limitRate,logicScale,logicAdjust,
-    (unsigned long)frameElapsed,(unsigned long)sleepRemaining,(unsigned long)sleepTotal,(unsigned long)previousFrame,(unsigned long)w3dFrame,(int)engineActive,(int)foreground);
+    (unsigned long)frameElapsed,(unsigned long)sleepRemaining,(unsigned long)sleepTotal,(unsigned long)previousFrame,(unsigned long)w3dFrame,(int)engineActive,(int)foreground,
+    clientMinusSaved,savedGate,clientPeriod,clientCounter,clientRatio,(unsigned int)ratioPending,(unsigned int)gameClientAdvance,clientLimit,(unsigned long)network,(unsigned long)networkVtable,nativeState,nativeQpcAgeMs,nativeAccumulatorMs,nativePacing,nativeReady,(long)InterlockedCompareExchange(&g_networkFocusRebases,0,0),(long)InterlockedCompareExchange(&g_networkSessionResets,0,0));
   if(n<0||n>=(int)sizeof(line))n=sizeof(line)-1;line[n]=0;
   open_timing_log();if(g_timingLog!=INVALID_HANDLE_VALUE)WriteFile(g_timingLog,line,(DWORD)n,&wrote,0);
   g_timing.lastLogMs=now;g_timing.lastClass=classification;
@@ -575,8 +610,9 @@ static void complete_legacy_phases(void *engine,LONG firstPhase){
   for(phase=firstPhase;phase<=6;phase++){proc(engine,0,phase);InterlockedIncrement(&g_legacyPhaseCalls);}
 }
 static void __stdcall schedule_time_tick(void *engine,LONG newPeriod){
-  LARGE_INTEGER now;double delta,instant,alpha;void *logic;int mode,loading,paused;TimingClass classification;BOOL due,discarded;LONG pending,previousAttempt;
+  LARGE_INTEGER now;double delta,instant,alpha;void *logic;int mode,loading,paused;TimingClass classification;BOOL due,discarded;LONG pending,previousAttempt,foreground;
   InterlockedExchange(&g_dueDecision,0);InterlockedExchange(&g_phaseDecision,newPeriod);InterlockedExchange(&g_skipPhaseDispatch,0);
+  foreground=process_is_foreground();observe_focus_state(foreground);
   /* If the last admission attempt did not reach the GameLogic entry hook,
      native BFME blocked it.  Its readiness getter is a poll: on a blocked
      guest it may pump incoming packets, and on a router it advances only its
@@ -586,14 +622,46 @@ static void __stdcall schedule_time_tick(void *engine,LONG newPeriod){
   QueryPerformanceCounter(&now);
   if(!g_timing.initialized||!g_timing.frequency.QuadPart){reset_time_scheduler(engine);g_timing.lastQpc=now;hold_visual_phase(engine,newPeriod,TRUE);return;}
   delta=(double)(now.QuadPart-g_timing.lastQpc.QuadPart)/(double)g_timing.frequency.QuadPart;g_timing.lastQpc=now;++g_timing.visualFrames;
-  if(!(delta>0.0)||delta>0.75){discard_pending_tick(TRUE);hold_visual_phase(engine,newPeriod,TRUE);log_timing(SUSPENDED_LARGE_GAP,"RESET/DISCARDED_STALL",TRUE);return;}
+  if(!(delta>0.0)||delta>0.75){
+    if(foreground&&(g_timing.lastMode==1||g_timing.lastMode==5))InterlockedExchange(&g_networkFocusRebasePending,1);
+    discard_pending_tick(TRUE);hold_visual_phase(engine,newPeriod,TRUE);log_timing(SUSPENDED_LARGE_GAP,"RESET/DISCARDED_STALL",TRUE);return;
+  }
   instant=1.0/delta;if(instant<1.0)instant=1.0;if(instant>240.0)instant=240.0;
   if(!(g_timing.fps>0.0))g_timing.fps=instant;else{alpha=delta/(0.5+delta);g_timing.fps+=(instant-g_timing.fps)*alpha;}
   logic=*(void**)(g_image+(0x012F0898-0x00400000));
-  if(!logic){InterlockedExchange(&g_w3dClockFrozen,0);g_timing.lastLogic=0;g_timing.lastMode=-1;discard_pending_tick(TRUE);hold_visual_phase(engine,newPeriod,TRUE);log_timing(LOADING_TRANSITION,"RESET/DISCARDED_NO_LOGIC",FALSE);return;}
+  if(!logic){InterlockedExchange(&g_w3dClockFrozen,0);InterlockedExchange(&g_networkSessionResetPending,0);g_timing.lastLogic=0;g_timing.lastMode=-1;discard_pending_tick(TRUE);hold_visual_phase(engine,newPeriod,TRUE);log_timing(LOADING_TRANSITION,"RESET/DISCARDED_NO_LOGIC",FALSE);return;}
   mode=*(volatile int*)((BYTE*)logic+0x10C);loading=(*(volatile BYTE*)((BYTE*)logic+0x69)!=0)||(*(volatile BYTE*)((BYTE*)logic+0x6A)!=0)||(*(volatile BYTE*)((BYTE*)logic+0x9D)!=0);
-  if(logic!=g_timing.lastLogic||mode!=g_timing.lastMode){InterlockedExchange(&g_w3dClockFrozen,0);discard_pending_tick(TRUE);g_timing.lastLogic=logic;g_timing.lastMode=mode;hold_visual_phase(engine,newPeriod,TRUE);log_timing(LOADING_TRANSITION,"RESET/DISCARDED_LIFECYCLE",TRUE);return;}
+  if(logic!=g_timing.lastLogic||mode!=g_timing.lastMode){
+    InterlockedExchange(&g_w3dClockFrozen,0);discard_pending_tick(TRUE);
+    g_timing.lastLogic=logic;g_timing.lastMode=mode;
+    InterlockedExchange(&g_networkSessionResetPending,(mode==1||mode==5)?1:0);
+    hold_visual_phase(engine,newPeriod,TRUE);
+    if(!loading&&InterlockedCompareExchange(&g_networkSessionResetPending,0,0)!=0&&rebase_native_network_clock(now,FALSE)){
+      InterlockedExchange(&g_networkSessionResetPending,0);InterlockedExchange(&g_networkFocusRebasePending,0);
+      InterlockedIncrement(&g_networkSessionResets);
+      log_timing(LOADING_TRANSITION,"NETWORK_SESSION_CLOCK_INITIALIZED",TRUE);return;
+    }
+    log_timing(LOADING_TRANSITION,"RESET/DISCARDED_LIFECYCLE",TRUE);return;
+  }
   if(loading){InterlockedExchange(&g_w3dClockFrozen,0);discard_pending_tick(TRUE);hold_visual_phase(engine,newPeriod,TRUE);log_timing(LOADING_TRANSITION,"RESET/DISCARDED_LOADING",FALSE);return;}
+  if(InterlockedCompareExchange(&g_networkSessionResetPending,0,0)!=0){
+    if(mode==1||mode==5){
+      if(rebase_native_network_clock(now,FALSE)){
+        InterlockedExchange(&g_networkSessionResetPending,0);InterlockedExchange(&g_networkFocusRebasePending,0);
+        InterlockedIncrement(&g_networkSessionResets);discard_pending_tick(TRUE);hold_visual_phase(engine,newPeriod,TRUE);
+        log_timing(LOADING_TRANSITION,"NETWORK_SESSION_CLOCK_INITIALIZED",TRUE);return;
+      }
+    }else InterlockedExchange(&g_networkSessionResetPending,0);
+  }
+  if(foreground&&InterlockedCompareExchange(&g_networkFocusRebasePending,0,0)!=0){
+    if(mode==1||mode==5){
+      if(rebase_native_network_clock(now,TRUE)){
+        InterlockedExchange(&g_networkFocusRebasePending,0);
+        InterlockedIncrement(&g_networkFocusRebases);
+        log_timing(ACTIVE_SIMULATION,"FOCUS_NETWORK_CLOCK_REBASED",TRUE);
+      }
+    }else InterlockedExchange(&g_networkFocusRebasePending,0);
+  }
   paused=*(volatile BYTE*)((BYTE*)logic+0x11C)!=0;
   if(paused||engine_time_frozen()){
     InterlockedExchange(&g_w3dClockFrozen,1);
@@ -797,6 +865,7 @@ static void dump_client_scheduler_code(BYTE *image){dump_region("BFME_60FPS_CLIE
 typedef struct { DWORD kind,source,object,vtable,slot,target; } ClientManagerRecord;
 static void add_direct(ClientManagerRecord *r,DWORD source,DWORD target){r->kind=1;r->source=source;r->object=0;r->vtable=0;r->slot=0;r->target=(DWORD)(ULONG_PTR)(g_image+(target-0x00400000));}
 static BOOL read32(DWORD address,DWORD *value){SIZE_T got=0;*value=0;return ReadProcessMemory(GetCurrentProcess(),(void*)(ULONG_PTR)address,value,4,&got)&&got==4;}
+static BOOL read64(DWORD address,LONGLONG *value){SIZE_T got=0;*value=0;return ReadProcessMemory(GetCurrentProcess(),(void*)(ULONG_PTR)address,value,8,&got)&&got==8;}
 static DWORD resolve_jump(DWORD target){DWORD i,disp,next;BYTE op;SIZE_T got;for(i=0;i<8;i++){got=0;if(!ReadProcessMemory(GetCurrentProcess(),(void*)(ULONG_PTR)target,&op,1,&got)||got!=1||op!=0xE9)break;if(!read32(target+1,&disp))break;next=target+5+(LONG)disp;if(next<(DWORD)(ULONG_PTR)g_image||next>=(DWORD)(ULONG_PTR)(g_image+0x1000000)||next==target)break;target=next;}return target;}
 static void add_virtual(ClientManagerRecord *r,DWORD global,DWORD add,DWORD slot){DWORD object=0;r->kind=2;r->source=global;r->object=0;r->vtable=0;r->slot=slot;r->target=0;if(!read32((DWORD)(ULONG_PTR)(g_image+(global-0x00400000)),&object)||!object)return;r->object=object+add;if(!read32(r->object,&r->vtable)||!r->vtable)return;read32(r->vtable+slot,&r->target);}
 static void __stdcall capture_client_managers(void){
